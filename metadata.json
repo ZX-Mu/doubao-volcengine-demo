@@ -1,0 +1,12 @@
+{
+  "name": "Volcengine Speech Demo Clone",
+  "description": "A high-fidelity replica of Volcengine's ASR and TTS demo pages, featuring Doubao Large Model speech services with real-time WebSocket streaming.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "ASR",
+    "TTS",
+    "WebSocket Streaming"
+  ]
+}
