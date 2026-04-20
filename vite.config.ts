@@ -185,6 +185,7 @@ function createVolcengineProxyPlugin() {
             speechRate,
             loudnessRate,
             pitchRate,
+            enableSubtitle,
             reqId,
           } = body ?? {};
 
@@ -220,6 +221,7 @@ function createVolcengineProxyPlugin() {
                   speech_rate: typeof speechRate === 'number' ? speechRate : 0,
                   loudness_rate: typeof loudnessRate === 'number' ? loudnessRate : 0,
                   pitch_rate: typeof pitchRate === 'number' ? pitchRate : 0,
+                  enable_subtitle: enableSubtitle === true,
                 },
               },
             }),

@@ -152,11 +152,12 @@ export default function TTSDemo({ config, onLog }: { config: any; onLog: (type: 
     const isWsUnidirectionalMode = ttsMode.id === TTS_MODE_IDS.WS_UNIDIRECTIONAL_V3;
     const isWsBidirectionalMode = ttsMode.id === TTS_MODE_IDS.WS_BIDIRECTIONAL_V3;
     const activeTts = isWsBidirectionalMode ? wsBidirectionalTts : isWsUnidirectionalMode ? wsTts : sseTts;
-    const { speak, stop, isPlaying, error, audioUrl, fileName, chunkCount, audioByteLength } = activeTts;
+    const { speak, stop, isPlaying, error, audioUrl, fileName, chunkCount, audioByteLength, sentences, metrics, currentTimeSec } = activeTts;
     const onLogRef = useRef(onLog);
     useEffect(() => { onLogRef.current = onLog; });
     const stableLog = useCallback((type: string, msg: string) => onLogRef.current(type, msg), []);
     const lastChunkCountRef = useRef(0);
+    const lastSentenceCountRef = useRef(0);
 
     useEffect(() => () => {
         stopSse();
@@ -182,10 +183,39 @@ export default function TTSDemo({ config, onLog }: { config: any; onLog: (type: 
     }, [audioByteLength, stableLog]);
 
     useEffect(() => {
+        if (metrics.firstChunkMs !== null) {
+            stableLog('TTS', `First audio chunk in ${metrics.firstChunkMs.toFixed(0)}ms`);
+        }
+    }, [metrics.firstChunkMs, stableLog]);
+
+    useEffect(() => {
+        if (metrics.firstPlaybackMs !== null) {
+            stableLog('TTS', `First audible playback in ${metrics.firstPlaybackMs.toFixed(0)}ms`);
+        }
+    }, [metrics.firstPlaybackMs, stableLog]);
+
+    useEffect(() => {
         if (audioUrl) {
             stableLog('Success', 'TTS 音频流接收完成');
         }
     }, [audioUrl, stableLog]);
+
+    useEffect(() => {
+        if (sentences.length > lastSentenceCountRef.current) {
+            const latest = sentences[sentences.length - 1];
+            lastSentenceCountRef.current = sentences.length;
+            stableLog(
+                'TTS',
+                `Timestamp sentence ${sentences.length}: ${latest.text} (${latest.words.length} words)`,
+            );
+            stableLog(
+                'TTS',
+                latest.words
+                    .map((word) => `${word.word}[${word.startTime.toFixed(3)}-${word.endTime.toFixed(3)}]`)
+                    .join(' '),
+            );
+        }
+    }, [sentences, stableLog]);
 
     const handleSpeak = () => {
         if (!ttsMode.implemented) {
@@ -201,6 +231,7 @@ export default function TTSDemo({ config, onLog }: { config: any; onLog: (type: 
             stopWs();
             stopWsBidirectional();
             lastChunkCountRef.current = 0;
+            lastSentenceCountRef.current = 0;
             stableLog('TTS', `[${isWsBidirectionalMode ? 'WS-BIDI-V3' : isWsUnidirectionalMode ? 'WS-V3' : 'SSE-V3'}] Requesting ${ttsMode.name} for ${text.length} characters...`);
             speak(text, {
                 appId: config.appId,
@@ -213,6 +244,30 @@ export default function TTSDemo({ config, onLog }: { config: any; onLog: (type: 
             });
         }
     };
+
+    const renderHighlightedSentence = (sentence: typeof sentences[number], sentenceIndex: number) => (
+        <p key={`${sentenceIndex}-${sentence.text}`} className="text-sm leading-relaxed text-[#1D2129]">
+            {sentence.words.map((word, wordIndex) => {
+                const isActive = currentTimeSec >= word.startTime && currentTimeSec < word.endTime;
+                const isDone = currentTimeSec >= word.endTime;
+
+                return (
+                    <span
+                        key={`${sentenceIndex}-${wordIndex}-${word.word}`}
+                        className={`transition-colors ${
+                            isActive
+                                ? 'bg-primary text-white rounded px-0.5'
+                                : isDone
+                                    ? 'text-primary'
+                                    : 'text-[#4E5969]'
+                        }`}
+                    >
+                        {word.word}
+                    </span>
+                );
+            })}
+        </p>
+    );
 
     return (
         <div className="h-full flex flex-col p-5 bg-white border-l border-border-main">
@@ -286,7 +341,7 @@ export default function TTSDemo({ config, onLog }: { config: any; onLog: (type: 
                     </div>
                 </div>
 
-                <div className="bg-bg-sub rounded-lg p-3 flex flex-col gap-3">
+                    <div className="bg-bg-sub rounded-lg p-3 flex flex-col gap-3">
                     <div className="flex items-center gap-3">
                         <button
                             onClick={handleSpeak}
@@ -326,6 +381,43 @@ export default function TTSDemo({ config, onLog }: { config: any; onLog: (type: 
                         <span className="text-[10px] font-mono text-text-secondary">
                             {chunkCount > 0 ? `${chunkCount} chunks` : 'waiting'}
                         </span>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2">
+                        <div className="bg-white border border-border-main rounded px-3 py-2">
+                            <div className="text-[10px] font-bold text-text-secondary uppercase">首包到达</div>
+                            <div className="mt-1 text-sm font-mono text-[#1D2129]">
+                                {metrics.firstChunkMs !== null ? `${metrics.firstChunkMs.toFixed(0)} ms` : '--'}
+                            </div>
+                        </div>
+                        <div className="bg-white border border-border-main rounded px-3 py-2">
+                            <div className="text-[10px] font-bold text-text-secondary uppercase">首次出声</div>
+                            <div className="mt-1 text-sm font-mono text-[#1D2129]">
+                                {metrics.firstPlaybackMs !== null ? `${metrics.firstPlaybackMs.toFixed(0)} ms` : '--'}
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="bg-white border border-border-main rounded-lg p-3 flex flex-col gap-2 max-h-56 overflow-y-auto">
+                        <div className="flex items-center justify-between">
+                            <span className="text-[10px] font-bold text-text-secondary uppercase">字幕跟随</span>
+                            <span className="text-[10px] font-mono text-text-secondary">
+                                {sentences.length > 0 ? `${currentTimeSec.toFixed(2)}s` : 'waiting'}
+                            </span>
+                        </div>
+                        {sentences.length === 0 ? (
+                            <p className="text-[11px] text-text-secondary leading-relaxed">
+                                页面现在只展示播放中的字幕高亮效果。详细字级时间戳已输出到下方运行控制台，便于你直接检查返回内容。
+                            </p>
+                        ) : (
+                            <div className="flex flex-col gap-3">
+                                {sentences.map((sentence, index) => (
+                                    <div key={`${index}-${sentence.text}`} className="rounded border border-border-main bg-bg-sub px-3 py-2">
+                                        {renderHighlightedSentence(sentence, index)}
+                                    </div>
+                                ))}
+                            </div>
+                        )}
                     </div>
                 </div>
             </div>

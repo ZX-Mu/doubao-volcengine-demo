@@ -1,5 +1,8 @@
 import { useState, useCallback, useRef } from 'react';
 import { generateReqId } from '../utils/volcengine';
+import { appendTTSSentenceTimestamp, parseTTSSentenceTimestamp, type TTSSentenceTimestamp } from '../utils/ttsSubtitle';
+import { StreamingAudioPlayer } from '../utils/streamingAudioPlayer';
+import { createInitialTTSMetrics, type TTSMetrics } from '../utils/ttsMetrics';
 
 interface TTSOptions {
     appId: string;
@@ -16,6 +19,9 @@ interface TTSState {
     audioUrl: string | null;
     fileName: string;
     audioByteLength: number;
+    sentences: TTSSentenceTimestamp[];
+    metrics: TTSMetrics;
+    currentTimeSec: number;
 }
 
 function isErrorPayload(payload: any) {
@@ -66,14 +72,20 @@ export function useTTS() {
         audioUrl: null,
         fileName: 'doubao-tts.mp3',
         audioByteLength: 0,
+        sentences: [],
+        metrics: createInitialTTSMetrics(),
+        currentTimeSec: 0,
     });
 
     const abortControllerRef = useRef<AbortController | null>(null);
     const audioRef = useRef<HTMLAudioElement | null>(null);
+    const streamingPlayerRef = useRef<StreamingAudioPlayer | null>(null);
 
     const stop = useCallback(() => {
         abortControllerRef.current?.abort();
         abortControllerRef.current = null;
+        streamingPlayerRef.current?.stop();
+        streamingPlayerRef.current = null;
         if (audioRef.current) {
             audioRef.current.pause();
             audioRef.current.currentTime = 0;
@@ -104,11 +116,48 @@ export function useTTS() {
             audioUrl: null,
             fileName: `doubao-tts-${Date.now()}.mp3`,
             audioByteLength: 0,
+            sentences: [],
+            metrics: createInitialTTSMetrics(),
+            currentTimeSec: 0,
         });
         setIsPlaying(true);
 
         const controller = new AbortController();
         abortControllerRef.current = controller;
+        const requestStartedAt = performance.now();
+        let firstChunkRecorded = false;
+        let firstPlaybackRecorded = false;
+        const streamingPlayer = new StreamingAudioPlayer();
+        const streamingReady = await streamingPlayer.init();
+        if (streamingReady) {
+            streamingPlayerRef.current = streamingPlayer;
+            audioRef.current = streamingPlayer.audio;
+            streamingPlayer.audio.onplaying = () => {
+                if (firstPlaybackRecorded) return;
+                firstPlaybackRecorded = true;
+                setTtsState((prev) => ({
+                    ...prev,
+                    metrics: {
+                        ...prev.metrics,
+                        firstPlaybackMs: performance.now() - requestStartedAt,
+                    },
+                }));
+            };
+            streamingPlayer.audio.onended = () => {
+                setIsPlaying(false);
+            };
+            streamingPlayer.audio.ontimeupdate = () => {
+                setTtsState((prev) => ({
+                    ...prev,
+                    currentTimeSec: streamingPlayer.audio.currentTime,
+                }));
+            };
+            streamingPlayer.audio.onerror = () => {
+                const mediaError = streamingPlayer.audio.error;
+                setError(`浏览器播放音频失败(code=${mediaError?.code ?? 'unknown'})，请尝试下载后确认返回格式`);
+                setIsPlaying(false);
+            };
+        }
 
         try {
             const response = await fetch('/api/proxy/tts/sse', {
@@ -125,6 +174,7 @@ export function useTTS() {
                     speechRate: options.speechRate ?? 0,
                     pitchRate: options.pitchRate ?? 0,
                     loudnessRate: options.loudnessRate ?? 0,
+                    enableSubtitle: true,
                     reqId: generateReqId(),
                 }),
                 signal: controller.signal,
@@ -141,7 +191,7 @@ export function useTTS() {
             const audioChunks: Uint8Array[] = [];
             let chunkCount = 0;
 
-            const handleEventBlock = (block: string) => {
+            const handleEventBlock = async (block: string) => {
                 const lines = block.split('\n');
                 const dataLines = lines
                     .filter((line) => line.startsWith('data:'))
@@ -172,11 +222,33 @@ export function useTTS() {
 
                 const audioBase64 = getAudioChunk(payload);
                 if (!audioBase64) {
-                    console.info('[TTS Event]', payload);
+                    const sentence = parseTTSSentenceTimestamp(payload);
+                    if (sentence) {
+                        setTtsState((prev) => ({
+                            ...prev,
+                            sentences: appendTTSSentenceTimestamp(prev.sentences, sentence),
+                        }));
+                    } else {
+                        console.info('[TTS Event]', payload);
+                    }
                     return;
                 }
 
-                audioChunks.push(decodeBase64Chunk(audioBase64));
+                const audioChunk = decodeBase64Chunk(audioBase64);
+                audioChunks.push(audioChunk);
+                if (!firstChunkRecorded) {
+                    firstChunkRecorded = true;
+                    setTtsState((prev) => ({
+                        ...prev,
+                        metrics: {
+                            ...prev.metrics,
+                            firstChunkMs: performance.now() - requestStartedAt,
+                        },
+                    }));
+                }
+                if (streamingReady) {
+                    await streamingPlayer.appendChunk(audioChunk);
+                }
                 chunkCount += 1;
                 setTtsState((prev) => ({
                     ...prev,
@@ -193,12 +265,12 @@ export function useTTS() {
                 buffer = blocks.pop() ?? '';
 
                 for (const block of blocks) {
-                    handleEventBlock(block);
+                    await handleEventBlock(block);
                 }
             }
 
             if (buffer.trim()) {
-                handleEventBlock(buffer);
+                await handleEventBlock(buffer);
             }
 
             const mergedAudio = concatUint8Arrays(audioChunks);
@@ -214,17 +286,11 @@ export function useTTS() {
             });
             console.info('[TTS Stream]', 'completed');
 
+            if (streamingReady) {
+                streamingPlayer.finish();
+            }
+
             const blobUrl = URL.createObjectURL(new Blob([mergedAudio], { type: 'audio/mpeg' }));
-            const audio = new Audio(blobUrl);
-            audioRef.current = audio;
-            audio.onended = () => {
-                setIsPlaying(false);
-            };
-            audio.onerror = () => {
-                const mediaError = audio.error;
-                setError(`浏览器播放音频失败(code=${mediaError?.code ?? 'unknown'})，请尝试下载后确认返回格式`);
-                setIsPlaying(false);
-            };
 
             setTtsState((prev) => ({
                 ...prev,
@@ -232,7 +298,36 @@ export function useTTS() {
                 audioByteLength: mergedAudio.length,
             }));
 
-            await audio.play();
+            if (!streamingReady) {
+                const audio = new Audio(blobUrl);
+                audioRef.current = audio;
+                audio.onplaying = () => {
+                    if (firstPlaybackRecorded) return;
+                    firstPlaybackRecorded = true;
+                    setTtsState((prev) => ({
+                        ...prev,
+                        metrics: {
+                            ...prev.metrics,
+                            firstPlaybackMs: performance.now() - requestStartedAt,
+                        },
+                    }));
+                };
+                audio.onended = () => {
+                    setIsPlaying(false);
+                };
+                audio.ontimeupdate = () => {
+                    setTtsState((prev) => ({
+                        ...prev,
+                        currentTimeSec: audio.currentTime,
+                    }));
+                };
+                audio.onerror = () => {
+                    const mediaError = audio.error;
+                    setError(`浏览器播放音频失败(code=${mediaError?.code ?? 'unknown'})，请尝试下载后确认返回格式`);
+                    setIsPlaying(false);
+                };
+                await audio.play();
+            }
         } catch (err: any) {
             if (err?.name !== 'AbortError') {
                 setError(err?.message || 'TTS 初始化失败');
@@ -252,5 +347,8 @@ export function useTTS() {
         fileName: ttsState.fileName,
         chunkCount: ttsState.chunkCount,
         audioByteLength: ttsState.audioByteLength,
+        sentences: ttsState.sentences,
+        metrics: ttsState.metrics,
+        currentTimeSec: ttsState.currentTimeSec,
     };
 }
