@@ -5,6 +5,7 @@ import { StreamingAudioPlayer } from '../utils/streamingAudioPlayer';
 import { createInitialTTSMetrics, type TTSMetrics } from '../utils/ttsMetrics';
 
 const TTS_WS_PROXY_URL = '/api/proxy/tts/ws-unidirectional';
+const TTS_WS_DIRECT_URL = 'wss://openspeech.bytedance.com/api/v3/tts/unidirectional/stream';
 
 interface TTSWsOptions {
     appId: string;
@@ -14,6 +15,7 @@ interface TTSWsOptions {
     speechRate?: number;
     pitchRate?: number;
     loudnessRate?: number;
+    direct?: boolean;
 }
 
 interface TTSWsState {
@@ -221,8 +223,10 @@ export function useTTSWsUnidirectional() {
     const wsRef = useRef<WebSocket | null>(null);
     const audioRef = useRef<HTMLAudioElement | null>(null);
     const streamingPlayerRef = useRef<StreamingAudioPlayer | null>(null);
+    const stoppedByUserRef = useRef(false);
 
     const stop = useCallback(() => {
+        stoppedByUserRef.current = true;
         const ws = wsRef.current;
         wsRef.current = null;
         streamingPlayerRef.current?.stop();
@@ -240,6 +244,7 @@ export function useTTSWsUnidirectional() {
 
     const speak = useCallback(async (text: string, options: TTSWsOptions) => {
         stop();
+        stoppedByUserRef.current = false;
         setError(null);
 
         if (!options.appId || !options.token || !options.resourceId) {
@@ -267,7 +272,11 @@ export function useTTSWsUnidirectional() {
         setIsPlaying(true);
 
         const requestStartedAt = performance.now();
-        const wsUrl = `${TTS_WS_PROXY_URL}?appId=${encodeURIComponent(options.appId)}&token=${encodeURIComponent(options.token)}&resourceId=${encodeURIComponent(options.resourceId)}`;
+        // 直连模式：浏览器直接连火山引擎 WSS，认证信息放 query params
+        // 代理模式：通过 vite dev proxy 中转，由服务端添加认证 Header
+        const wsUrl = options.direct
+            ? `${TTS_WS_DIRECT_URL}?api_appid=${encodeURIComponent(options.appId)}&api_access_key=${encodeURIComponent(options.token)}&api_resource_id=${encodeURIComponent(options.resourceId)}`
+            : `${TTS_WS_PROXY_URL}?appId=${encodeURIComponent(options.appId)}&token=${encodeURIComponent(options.token)}&resourceId=${encodeURIComponent(options.resourceId)}`;
         const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
         ws.binaryType = 'arraybuffer';
@@ -367,6 +376,7 @@ export function useTTSWsUnidirectional() {
         };
 
         ws.onopen = () => {
+            console.info(`[TTS WS onopen] 连接成功 url=${wsUrl.replace(/token=[^&]+/, 'token=***')}`);
             const reqId = generateReqId();
             const request = {
                 user: {
@@ -484,15 +494,26 @@ export function useTTSWsUnidirectional() {
             }
         };
 
-        ws.onerror = () => {
+        ws.onerror = (ev) => {
+            console.error('[TTS WS onerror]', ev);
             setError('TTS WebSocket 连接失败，请确认配置和权限有效');
             setIsPlaying(false);
         };
 
-        ws.onclose = () => {
+        ws.onclose = (ev) => {
+            console.warn(`[TTS WS onclose] code=${ev.code} reason="${ev.reason}" wasClean=${ev.wasClean}`);
             wsRef.current = null;
             if (!finalized && audioChunks.length > 0) {
                 void finalizeAudio();
+            }
+            // 用户主动停止或正常关闭不报错
+            if (stoppedByUserRef.current || finalized || ev.code === 1000 || ev.code === 1005) {
+                return;
+            }
+            // 非正常关闭，给出详细错误信息
+            if (audioChunks.length === 0) {
+                setError(`TTS WebSocket 被关闭 (code=${ev.code}, reason="${ev.reason || '无'}")`);
+                setIsPlaying(false);
             }
         };
     }, [stop, ttsState.audioUrl]);

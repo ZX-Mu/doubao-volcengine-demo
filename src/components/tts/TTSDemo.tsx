@@ -8,8 +8,10 @@ import { TTS_MODE_IDS } from '../../utils/ttsMode';
 
 const TTS_MODES = [
   { id: TTS_MODE_IDS.SSE_V3, name: '单向流式模式（HTTP SSE V3）', resourceId: 'seed-tts-2.0', implemented: true },
-  { id: TTS_MODE_IDS.WS_UNIDIRECTIONAL_V3, name: '单向流式模式（WebSocket V3）', resourceId: 'seed-tts-2.0', implemented: true },
-  { id: TTS_MODE_IDS.WS_BIDIRECTIONAL_V3, name: '双向流式模式（WebSocket V3）', resourceId: 'seed-tts-2.0', implemented: true },
+  { id: TTS_MODE_IDS.WS_UNIDIRECTIONAL_V3, name: '单向流式模式（WebSocket V3 Proxy）', resourceId: 'seed-tts-2.0', implemented: true },
+  { id: TTS_MODE_IDS.WS_BIDIRECTIONAL_V3, name: '双向流式模式（WebSocket V3 Proxy）', resourceId: 'seed-tts-2.0', implemented: true },
+  { id: TTS_MODE_IDS.WS_UNIDIRECTIONAL_DIRECT, name: '单向流式模式（WebSocket V3 直连）', resourceId: 'seed-tts-2.0', implemented: true },
+  { id: TTS_MODE_IDS.WS_BIDIRECTIONAL_DIRECT, name: '双向流式模式（WebSocket V3 直连）', resourceId: 'seed-tts-2.0', implemented: true },
 ];
 
 type SpeakerOption = {
@@ -142,6 +144,9 @@ export default function TTSDemo({ config, onLog }: { config: any; onLog: (type: 
     const [ttsMode, setTtsMode] = useState(TTS_MODES[0]);
     const [resourceId, setResourceId] = useState(TTS_MODES[0].resourceId);
     const [selectedSpeaker, setSelectedSpeaker] = useState(SPEAKERS[0]);
+    const [simulateStreamingInput, setSimulateStreamingInput] = useState(true);
+    const [streamChunkSize, setStreamChunkSize] = useState(6);
+    const [streamDelayMs, setStreamDelayMs] = useState(80);
 
     const sseTts = useTTS();
     const wsTts = useTTSWsUnidirectional();
@@ -149,15 +154,18 @@ export default function TTSDemo({ config, onLog }: { config: any; onLog: (type: 
     const stopSse = sseTts.stop;
     const stopWs = wsTts.stop;
     const stopWsBidirectional = wsBidirectionalTts.stop;
-    const isWsUnidirectionalMode = ttsMode.id === TTS_MODE_IDS.WS_UNIDIRECTIONAL_V3;
-    const isWsBidirectionalMode = ttsMode.id === TTS_MODE_IDS.WS_BIDIRECTIONAL_V3;
+    const isWsUnidirectionalMode = ttsMode.id === TTS_MODE_IDS.WS_UNIDIRECTIONAL_V3 || ttsMode.id === TTS_MODE_IDS.WS_UNIDIRECTIONAL_DIRECT;
+    const isWsBidirectionalMode = ttsMode.id === TTS_MODE_IDS.WS_BIDIRECTIONAL_V3 || ttsMode.id === TTS_MODE_IDS.WS_BIDIRECTIONAL_DIRECT;
+    const isDirect = ttsMode.id === TTS_MODE_IDS.WS_UNIDIRECTIONAL_DIRECT || ttsMode.id === TTS_MODE_IDS.WS_BIDIRECTIONAL_DIRECT;
     const activeTts = isWsBidirectionalMode ? wsBidirectionalTts : isWsUnidirectionalMode ? wsTts : sseTts;
     const { speak, stop, isPlaying, error, audioUrl, fileName, chunkCount, audioByteLength, sentences, metrics, currentTimeSec } = activeTts;
+    const inputChunks = isWsBidirectionalMode ? wsBidirectionalTts.inputChunks : [];
     const onLogRef = useRef(onLog);
     useEffect(() => { onLogRef.current = onLog; });
     const stableLog = useCallback((type: string, msg: string) => onLogRef.current(type, msg), []);
     const lastChunkCountRef = useRef(0);
     const lastSentenceCountRef = useRef(0);
+    const lastInputChunkCountRef = useRef(0);
 
     useEffect(() => () => {
         stopSse();
@@ -172,7 +180,7 @@ export default function TTSDemo({ config, onLog }: { config: any; onLog: (type: 
     useEffect(() => {
         if (chunkCount > 0 && chunkCount !== lastChunkCountRef.current) {
             lastChunkCountRef.current = chunkCount;
-            stableLog('TTS', `${isWsBidirectionalMode ? 'WS-BIDI' : isWsUnidirectionalMode ? 'WS' : 'SSE'} audio chunks received: ${chunkCount}`);
+            stableLog('TTS', `${isWsBidirectionalMode ? (isDirect ? 'WS-BIDI-DIRECT' : 'WS-BIDI') : isWsUnidirectionalMode ? (isDirect ? 'WS-DIRECT' : 'WS') : 'SSE'} audio chunks received: ${chunkCount}`);
         }
     }, [chunkCount, isWsBidirectionalMode, isWsUnidirectionalMode, stableLog]);
 
@@ -217,6 +225,19 @@ export default function TTSDemo({ config, onLog }: { config: any; onLog: (type: 
         }
     }, [sentences, stableLog]);
 
+    useEffect(() => {
+        if (!isWsBidirectionalMode) {
+            return;
+        }
+
+        if (inputChunks.length > lastInputChunkCountRef.current) {
+            const latestIndex = inputChunks.length - 1;
+            const latestChunk = inputChunks[latestIndex];
+            lastInputChunkCountRef.current = inputChunks.length;
+            stableLog('TTS', `Simulated input chunk ${inputChunks.length}: ${latestChunk}`);
+        }
+    }, [inputChunks, isWsBidirectionalMode, stableLog]);
+
     const handleSpeak = () => {
         if (!ttsMode.implemented) {
             stableLog('Error', `${ttsMode.name} 尚未按官方文档校对完成，当前只支持 HTTP SSE 单向流式-V3`);
@@ -232,7 +253,11 @@ export default function TTSDemo({ config, onLog }: { config: any; onLog: (type: 
             stopWsBidirectional();
             lastChunkCountRef.current = 0;
             lastSentenceCountRef.current = 0;
-            stableLog('TTS', `[${isWsBidirectionalMode ? 'WS-BIDI-V3' : isWsUnidirectionalMode ? 'WS-V3' : 'SSE-V3'}] Requesting ${ttsMode.name} for ${text.length} characters...`);
+            lastInputChunkCountRef.current = 0;
+            stableLog('TTS', `[${isWsBidirectionalMode ? (isDirect ? 'WS-BIDI-DIRECT' : 'WS-BIDI-V3') : isWsUnidirectionalMode ? (isDirect ? 'WS-DIRECT' : 'WS-V3') : 'SSE-V3'}] Requesting ${ttsMode.name} for ${text.length} characters...`);
+            if (isWsBidirectionalMode && simulateStreamingInput) {
+                stableLog('TTS', `Bidirectional input simulation enabled: chunk=${streamChunkSize}, delay=${streamDelayMs}ms`);
+            }
             speak(text, {
                 appId: config.appId,
                 token: config.token,
@@ -240,7 +265,11 @@ export default function TTSDemo({ config, onLog }: { config: any; onLog: (type: 
                 voiceType: selectedSpeaker.id,
                 speechRate: 0,
                 pitchRate: 0,
-                loudnessRate: 0
+                loudnessRate: 0,
+                simulateStreamingInput,
+                streamChunkSize,
+                streamDelayMs,
+                direct: isDirect,
             });
         }
     };
@@ -277,7 +306,7 @@ export default function TTSDemo({ config, onLog }: { config: any; onLog: (type: 
             </div>
 
             <textarea
-                className="flex-1 w-full bg-white border border-border-main rounded-lg p-4 text-sm text-[#4E5969] leading-relaxed resize-none focus:border-primary outline-none transition-all mb-4"
+                className="h-24 w-full shrink-0 bg-white border border-border-main rounded-lg p-4 text-sm text-[#4E5969] leading-relaxed resize-none focus:border-primary outline-none transition-all mb-4"
                 value={text}
                 onChange={(e) => setText(e.target.value)}
                 placeholder="请输入需要合成的文本..."
@@ -340,6 +369,44 @@ export default function TTSDemo({ config, onLog }: { config: any; onLog: (type: 
                         </p>
                     </div>
                 </div>
+
+                {isWsBidirectionalMode && (
+                    <div className="grid grid-cols-3 gap-3">
+                        <label className="flex items-center gap-2 bg-bg-sub border border-border-main rounded px-3 py-2 text-xs text-[#1D2129]">
+                            <input
+                                type="checkbox"
+                                checked={simulateStreamingInput}
+                                onChange={(e) => setSimulateStreamingInput(e.target.checked)}
+                            />
+                            模拟 Agent 流式输入
+                        </label>
+                        <div className="flex flex-col gap-1.5">
+                            <label className="text-[10px] font-bold text-text-secondary uppercase">单段长度</label>
+                            <input
+                                type="number"
+                                min={1}
+                                max={100}
+                                value={streamChunkSize}
+                                onChange={(e) => setStreamChunkSize(Math.max(1, Number(e.target.value) || 1))}
+                                className="bg-bg-sub border border-border-main rounded px-2 py-1.5 text-xs font-medium outline-none"
+                                disabled={!simulateStreamingInput}
+                            />
+                        </div>
+                        <div className="flex flex-col gap-1.5">
+                            <label className="text-[10px] font-bold text-text-secondary uppercase">发送间隔(ms)</label>
+                            <input
+                                type="number"
+                                min={30}
+                                max={5000}
+                                step={10}
+                                value={streamDelayMs}
+                                onChange={(e) => setStreamDelayMs(Math.max(30, Number(e.target.value) || 30))}
+                                className="bg-bg-sub border border-border-main rounded px-2 py-1.5 text-xs font-medium outline-none"
+                                disabled={!simulateStreamingInput}
+                            />
+                        </div>
+                    </div>
+                )}
 
                     <div className="bg-bg-sub rounded-lg p-3 flex flex-col gap-3">
                     <div className="flex items-center gap-3">
