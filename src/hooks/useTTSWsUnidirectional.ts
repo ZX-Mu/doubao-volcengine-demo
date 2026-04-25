@@ -3,6 +3,7 @@ import { constructHeader, generateReqId } from '../utils/volcengine';
 import { appendTTSSentenceTimestamp, parseTTSSentenceTimestamp, type TTSSentenceTimestamp } from '../utils/ttsSubtitle';
 import { StreamingAudioPlayer } from '../utils/streamingAudioPlayer';
 import { createInitialTTSMetrics, type TTSMetrics } from '../utils/ttsMetrics';
+import { redactSpeechUrl } from '../utils/auth';
 
 const TTS_WS_PROXY_URL = '/api/proxy/tts/ws-unidirectional';
 const TTS_WS_DIRECT_URL = 'wss://openspeech.bytedance.com/api/v3/tts/unidirectional/stream';
@@ -376,7 +377,7 @@ export function useTTSWsUnidirectional() {
         };
 
         ws.onopen = () => {
-            console.info(`[TTS WS onopen] 连接成功 url=${wsUrl.replace(/token=[^&]+/, 'token=***')}`);
+            console.info(`[TTS WS onopen] 连接成功 url=${redactSpeechUrl(wsUrl)}`);
             const reqId = generateReqId();
             const request = {
                 user: {

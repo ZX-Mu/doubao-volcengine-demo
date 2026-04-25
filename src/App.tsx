@@ -8,21 +8,20 @@ import Navbar from './components/layout/Navbar';
 import ConfigBar from './components/layout/ConfigBar';
 import TTSDemo from './components/tts/TTSDemo';
 import ASRDemo from './components/asr/ASRDemo';
-import { Settings, X, Terminal } from 'lucide-react';
+import { KeyRound, Settings, X, Terminal } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
+import { buildSpeechCredential, getJwtRemainingSeconds, type AuthMode, type SpeechConfig } from './utils/auth';
 
-interface Config {
-  appId: string;
-  token: string;
-}
-
-const DEFAULT_CONFIG: Config = {
+const DEFAULT_CONFIG: SpeechConfig = {
   appId: '',
   token: '',
+  authMode: 'access-token',
+  jwtToken: '',
+  jwtExpiresAt: null,
 };
 
 export default function App() {
-  const [config, setConfig] = useState<Config>(() => {
+  const [config, setConfig] = useState<SpeechConfig>(() => {
     const saved = localStorage.getItem('volengine_demo_config');
     if (saved) {
       const parsed = JSON.parse(saved);
@@ -32,6 +31,7 @@ export default function App() {
   });
   const [showSettings, setShowSettings] = useState(!config.appId);
   const [logs, setLogs] = useState<{ time: string; type: string; msg: string }[]>([]);
+  const [isFetchingJwt, setIsFetchingJwt] = useState(false);
 
   useEffect(() => {
     localStorage.setItem('volengine_demo_config', JSON.stringify(config));
@@ -40,6 +40,54 @@ export default function App() {
   const addLog = (type: string, msg: string) => {
     const now = new Date().toLocaleTimeString('zh-CN', { hour12: false });
     setLogs(prev => [{ time: now, type, msg }, ...prev].slice(0, 50));
+  };
+
+  const activeCredential = buildSpeechCredential(config);
+  const runtimeConfig = { ...config, token: activeCredential };
+  const jwtRemainingSeconds = getJwtRemainingSeconds(config.jwtExpiresAt);
+  const jwtAvailable = Boolean(config.jwtToken && jwtRemainingSeconds !== null && jwtRemainingSeconds > 0);
+
+  const updateAuthMode = (authMode: AuthMode) => {
+    setConfig((prev) => ({ ...prev, authMode }));
+  };
+
+  const fetchJwtToken = async () => {
+    if (!config.appId || !config.token) {
+      addLog('Error', '请先填写 App ID 和长期 Access Token，再获取 JWT 测试 token');
+      return;
+    }
+
+    setIsFetchingJwt(true);
+    try {
+      const duration = 3600;
+      const response = await fetch('/api/token/jwt', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          appId: config.appId,
+          token: config.token,
+          duration,
+        }),
+      });
+      const data = await response.json();
+
+      if (!response.ok || !data?.ok || !data?.jwtToken) {
+        addLog('Error', `获取 JWT token 失败: ${data?.error ?? `HTTP ${response.status}`}`);
+        return;
+      }
+
+      setConfig((prev) => ({
+        ...prev,
+        jwtToken: data.jwtToken,
+        jwtExpiresAt: Date.now() + (Number(data.duration ?? duration) * 1000),
+        authMode: 'jwt-test',
+      }));
+      addLog('Success', `已获取方案1 JWT token，有效期约 ${Math.floor(Number(data.duration ?? duration) / 60)} 分钟，已切换到 JWT 测试模式`);
+    } catch (err: any) {
+      addLog('Error', `获取 JWT token 异常: ${err?.message ?? '未知错误'}`);
+    } finally {
+      setIsFetchingJwt(false);
+    }
   };
 
   // ── Draggable console divider ─────────────────────────────────────────────
@@ -81,17 +129,22 @@ export default function App() {
   return (
     <div className="h-screen flex flex-col bg-bg-main overflow-hidden border border-border-main max-w-[1440px] mx-auto shadow-2xl">
       <Navbar />
-      <ConfigBar appId={config.appId} />
+      <ConfigBar
+        appId={config.appId}
+        authMode={config.authMode}
+        jwtAvailable={jwtAvailable}
+        jwtRemainingSeconds={jwtRemainingSeconds}
+      />
 
       <main className="flex-1 grid grid-cols-1 lg:grid-cols-2 gap-[1px] bg-border-main overflow-hidden">
         {/* ASR Panel */}
         <div className="bg-white overflow-y-auto">
-          <ASRDemo config={config} onLog={addLog} />
+          <ASRDemo config={runtimeConfig} onLog={addLog} />
         </div>
 
         {/* TTS Panel */}
         <div className="bg-white overflow-y-auto">
-          <TTSDemo config={config} onLog={addLog} />
+          <TTSDemo config={runtimeConfig} onLog={addLog} />
         </div>
       </main>
 
@@ -173,12 +226,63 @@ export default function App() {
                 <div className="flex flex-col gap-1.5">
                   <label className="text-[11px] font-bold text-text-secondary uppercase">Access Token</label>
                   <input
-                    type="password"
+                    type="text"
                     value={config.token}
                     onChange={(e) => setConfig({ ...config, token: e.target.value })}
                     className="p-2.5 rounded border border-border-main outline-none focus:border-primary text-sm bg-bg-main"
                     placeholder="输入 Access Token"
                   />
+                </div>
+                <div className="rounded border border-border-main bg-bg-main p-3 flex flex-col gap-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <div className="text-[11px] font-bold text-[#1D2129] uppercase">方案1 JWT 测试模式</div>
+                      <div className="text-[10px] text-text-secondary mt-1">
+                        本地服务用长期 token 换短期 JWT，前端直连时用 query 传递 JWT。
+                      </div>
+                    </div>
+                    <KeyRound className="w-4 h-4 text-primary shrink-0" />
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => updateAuthMode('access-token')}
+                      className={`h-8 rounded border text-xs font-semibold transition-colors ${
+                        config.authMode === 'access-token'
+                          ? 'bg-primary text-white border-primary'
+                          : 'bg-white text-[#4E5969] border-border-main hover:bg-gray-50'
+                      }`}
+                    >
+                      Access Token
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => updateAuthMode('jwt-test')}
+                      disabled={!config.jwtToken}
+                      className={`h-8 rounded border text-xs font-semibold transition-colors disabled:opacity-50 ${
+                        config.authMode === 'jwt-test'
+                          ? 'bg-primary text-white border-primary'
+                          : 'bg-white text-[#4E5969] border-border-main hover:bg-gray-50'
+                      }`}
+                    >
+                      JWT 测试
+                    </button>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={fetchJwtToken}
+                    disabled={!config.appId || !config.token || isFetchingJwt}
+                    className="h-9 rounded bg-white border border-border-main text-[#1D2129] text-xs font-semibold hover:bg-gray-50 disabled:opacity-50 inline-flex items-center justify-center gap-2"
+                  >
+                    <KeyRound className="w-3.5 h-3.5" />
+                    {isFetchingJwt ? '获取中...' : '获取 JWT Token 并启用'}
+                  </button>
+                  <div className="text-[10px] text-text-secondary leading-relaxed">
+                    {config.jwtToken
+                      ? `JWT token 已获取${jwtRemainingSeconds !== null ? `，剩余约 ${Math.ceil(jwtRemainingSeconds / 60)} 分钟` : ''}。`
+                      : '尚未获取 JWT token。'}
+                    {' '}JWT 只用于前端直连测试，不写入源码。
+                  </div>
                 </div>
                 <div className="mt-2 flex flex-col gap-3">
                   <button

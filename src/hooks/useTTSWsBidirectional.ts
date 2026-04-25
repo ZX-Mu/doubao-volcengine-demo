@@ -3,6 +3,7 @@ import { constructHeader, generateReqId } from '../utils/volcengine';
 import { appendTTSSentenceTimestamp, parseTTSSentenceTimestamp, type TTSSentenceTimestamp } from '../utils/ttsSubtitle';
 import { StreamingAudioPlayer } from '../utils/streamingAudioPlayer';
 import { createInitialTTSMetrics, type TTSMetrics } from '../utils/ttsMetrics';
+import { redactSpeechUrl } from '../utils/auth';
 
 const TTS_WS_BIDIRECTIONAL_PROXY_URL = '/api/proxy/tts/ws-bidirectional';
 const TTS_WS_BIDIRECTIONAL_DIRECT_URL = 'wss://openspeech.bytedance.com/api/v3/tts/bidirection';
@@ -536,7 +537,7 @@ export function useTTSWsBidirectional() {
         };
 
         ws.onopen = () => {
-            console.info(`[TTS WS Bidirectional onopen] 连接成功 url=${wsUrl.replace(/token=[^&]+/, 'token=***').replace(/X-Api-Access-Key=[^&]+/, 'X-Api-Access-Key=***')}`);
+            console.info(`[TTS WS Bidirectional onopen] 连接成功 url=${redactSpeechUrl(wsUrl)}`);
             const payload = new TextEncoder().encode('{}');
             ws.send(buildFrame({
                 messageType: MESSAGE_TYPE.FULL_CLIENT_REQUEST,

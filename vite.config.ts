@@ -7,6 +7,7 @@ import {defineConfig, loadEnv} from 'vite';
 
 const ASR_UPSTREAM_HOST = 'openspeech.bytedance.com';
 const TTS_UPSTREAM_URL = 'https://openspeech.bytedance.com/api/v3/tts/unidirectional/sse';
+const JWT_TOKEN_URL = 'https://openspeech.bytedance.com/api/v1/sts/token';
 const TTS_WS_UPSTREAM_PATH = '/api/v3/tts/unidirectional/stream';
 const TTS_WS_BIDIRECTIONAL_UPSTREAM_PATH = '/api/v3/tts/bidirection';
 const ASR_MODE_CONFIG = {
@@ -165,6 +166,70 @@ function createVolcengineProxyPlugin() {
           res.statusCode = 500;
           res.setHeader('Content-Type', 'application/json; charset=utf-8');
           res.end(JSON.stringify({ ok: false, error: error?.message || 'asr handshake check failed' }));
+        }
+      });
+
+      server.middlewares.use('/api/token/jwt', async (req: any, res: any, next: any) => {
+        if (req.method !== 'POST') {
+          next();
+          return;
+        }
+
+        try {
+          const body = await parseJsonBody(req);
+          const appId = String(body?.appId ?? '');
+          const token = String(body?.token ?? '');
+          const duration = Math.min(43200, Math.max(300, Number(body?.duration ?? 3600) || 3600));
+
+          if (!appId || !token) {
+            res.statusCode = 400;
+            res.setHeader('Content-Type', 'application/json; charset=utf-8');
+            res.end(JSON.stringify({ ok: false, error: 'missing appId or access token' }));
+            return;
+          }
+
+          const upstreamResponse = await fetch(JWT_TOKEN_URL, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer; ${token}`,
+            },
+            body: JSON.stringify({
+              appid: appId,
+              duration,
+            }),
+          });
+
+          const responseText = await upstreamResponse.text();
+          let responseJson: any = null;
+          try {
+            responseJson = responseText ? JSON.parse(responseText) : null;
+          } catch {
+            responseJson = null;
+          }
+
+          const jwtToken = responseJson?.jwt_token ?? responseJson?.jwtToken;
+          if (!upstreamResponse.ok || !jwtToken) {
+            res.statusCode = upstreamResponse.ok ? 502 : upstreamResponse.status;
+            res.setHeader('Content-Type', 'application/json; charset=utf-8');
+            res.end(JSON.stringify({
+              ok: false,
+              error: responseJson?.message ?? responseJson?.msg ?? responseJson?.error ?? responseText.slice(0, 300) ?? 'jwt token request failed',
+            }));
+            return;
+          }
+
+          res.statusCode = 200;
+          res.setHeader('Content-Type', 'application/json; charset=utf-8');
+          res.end(JSON.stringify({
+            ok: true,
+            jwtToken,
+            duration,
+          }));
+        } catch (error: any) {
+          res.statusCode = 500;
+          res.setHeader('Content-Type', 'application/json; charset=utf-8');
+          res.end(JSON.stringify({ ok: false, error: error?.message || 'jwt token request failed' }));
         }
       });
 
