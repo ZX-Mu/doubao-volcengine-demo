@@ -253,6 +253,10 @@ function getErrorMessage(parsed: ParsedBidirectionalFrame) {
     }
 }
 
+function summarizeText(text: string, maxLength = 500) {
+    return text.length > maxLength ? `${text.slice(0, maxLength)}...(${text.length} chars)` : text;
+}
+
 export function useTTSWsBidirectional() {
     const [isPlaying, setIsPlaying] = useState(false);
     const [error, setError] = useState<string | null>(null);
@@ -339,6 +343,27 @@ export function useTTSWsBidirectional() {
         setIsPlaying(true);
 
         const requestStartedAt = performance.now();
+        const logTiming = (stage: string, details: Record<string, unknown> = {}) => {
+            console.info('[TTS WS Bidirectional Timing]', {
+                mode: options.direct ? 'bidirectional-direct' : 'bidirectional-proxy',
+                stage,
+                elapsedMs: Math.round((performance.now() - requestStartedAt) * 100) / 100,
+                at: new Date().toISOString(),
+                ...details,
+            });
+        };
+        logTiming('speak:start', {
+            textLength: text.length,
+            text: summarizeText(text),
+            voiceType: options.voiceType,
+            speechRate: options.speechRate ?? 0,
+            pitchRate: options.pitchRate ?? 0,
+            loudnessRate: options.loudnessRate ?? 0,
+            resourceId: options.resourceId,
+            simulateStreamingInput: Boolean(options.simulateStreamingInput),
+            streamChunkSize: options.streamChunkSize ?? 12,
+            streamDelayMs: options.streamDelayMs ?? 120,
+        });
         const connectId = generateReqId();
         const sessionId = generateReqId();
         // 直连模式：浏览器直接连火山引擎 WSS，认证信息放 query params
@@ -347,18 +372,27 @@ export function useTTSWsBidirectional() {
             ? `${TTS_WS_BIDIRECTIONAL_DIRECT_URL}?api_appid=${encodeURIComponent(options.appId)}&api_access_key=${encodeURIComponent(options.token)}&api_resource_id=${encodeURIComponent(options.resourceId)}&api_connect_id=${encodeURIComponent(connectId)}`
             : `${TTS_WS_BIDIRECTIONAL_PROXY_URL}?appId=${encodeURIComponent(options.appId)}&token=${encodeURIComponent(options.token)}&resourceId=${encodeURIComponent(options.resourceId)}&connectId=${encodeURIComponent(connectId)}`;
         const ws = new WebSocket(wsUrl);
+        logTiming('ws:create', {
+            url: redactSpeechUrl(wsUrl),
+            connectId,
+            sessionId,
+        });
         wsRef.current = ws;
         ws.binaryType = 'arraybuffer';
         let firstChunkRecorded = false;
         let firstPlaybackRecorded = false;
         const streamingPlayer = new StreamingAudioPlayer();
         const streamingReady = await streamingPlayer.init();
+        logTiming('streaming-player:init', { streamingReady });
         if (streamingReady) {
             streamingPlayerRef.current = streamingPlayer;
             audioRef.current = streamingPlayer.audio;
             streamingPlayer.audio.onplaying = () => {
                 if (firstPlaybackRecorded) return;
                 firstPlaybackRecorded = true;
+                logTiming('audio:playing:first', {
+                    audioCurrentTimeSec: streamingPlayer.audio.currentTime,
+                });
                 setTtsState((prev) => ({
                     ...prev,
                     metrics: {
@@ -367,7 +401,24 @@ export function useTTSWsBidirectional() {
                     },
                 }));
             };
-            streamingPlayer.audio.onended = () => setIsPlaying(false);
+            streamingPlayer.audio.oncanplay = () => {
+                logTiming('audio:canplay', {
+                    audioCurrentTimeSec: streamingPlayer.audio.currentTime,
+                    readyState: streamingPlayer.audio.readyState,
+                });
+            };
+            streamingPlayer.audio.onwaiting = () => {
+                logTiming('audio:waiting', {
+                    audioCurrentTimeSec: streamingPlayer.audio.currentTime,
+                    readyState: streamingPlayer.audio.readyState,
+                });
+            };
+            streamingPlayer.audio.onended = () => {
+                logTiming('audio:ended', {
+                    audioCurrentTimeSec: streamingPlayer.audio.currentTime,
+                });
+                setIsPlaying(false);
+            };
             streamingPlayer.audio.ontimeupdate = () => {
                 setTtsState((prev) => ({
                     ...prev,
@@ -376,6 +427,7 @@ export function useTTSWsBidirectional() {
             };
             streamingPlayer.audio.onerror = () => {
                 const mediaError = streamingPlayer.audio.error;
+                logTiming('audio:error', { code: mediaError?.code ?? 'unknown' });
                 setError(`浏览器播放音频失败(code=${mediaError?.code ?? 'unknown'})，请尝试下载后确认返回格式`);
                 setIsPlaying(false);
             };
@@ -389,6 +441,7 @@ export function useTTSWsBidirectional() {
         const finalizeAudio = async () => {
             const mergedAudio = concatUint8Arrays(audioChunks);
             if (mergedAudio.length === 0) {
+                logTiming('audio:finalize:no-audio');
                 setError('TTS 双向 WebSocket 未返回音频数据');
                 stop();
                 return;
@@ -397,6 +450,11 @@ export function useTTSWsBidirectional() {
             if (streamingReady) {
                 streamingPlayer.finish();
             }
+            logTiming('audio:finalize', {
+                chunkCount,
+                totalAudioBytes: mergedAudio.length,
+                streamingReady,
+            });
 
             const blobUrl = URL.createObjectURL(new Blob([mergedAudio], { type: 'audio/mpeg' }));
 
@@ -412,6 +470,10 @@ export function useTTSWsBidirectional() {
                 audio.onplaying = () => {
                     if (firstPlaybackRecorded) return;
                     firstPlaybackRecorded = true;
+                    logTiming('audio:playing:first', {
+                        audioCurrentTimeSec: audio.currentTime,
+                        fallbackBlob: true,
+                    });
                     setTtsState((prev) => ({
                         ...prev,
                         metrics: {
@@ -420,7 +482,20 @@ export function useTTSWsBidirectional() {
                         },
                     }));
                 };
-                audio.onended = () => setIsPlaying(false);
+                audio.oncanplay = () => {
+                    logTiming('audio:canplay', {
+                        audioCurrentTimeSec: audio.currentTime,
+                        readyState: audio.readyState,
+                        fallbackBlob: true,
+                    });
+                };
+                audio.onended = () => {
+                    logTiming('audio:ended', {
+                        audioCurrentTimeSec: audio.currentTime,
+                        fallbackBlob: true,
+                    });
+                    setIsPlaying(false);
+                };
                 audio.ontimeupdate = () => {
                     setTtsState((prev) => ({
                         ...prev,
@@ -429,9 +504,11 @@ export function useTTSWsBidirectional() {
                 };
                 audio.onerror = () => {
                     const mediaError = audio.error;
+                    logTiming('audio:error', { code: mediaError?.code ?? 'unknown', fallbackBlob: true });
                     setError(`浏览器播放音频失败(code=${mediaError?.code ?? 'unknown'})，请尝试下载后确认返回格式`);
                     setIsPlaying(false);
                 };
+                logTiming('audio:play:attempt', { fallbackBlob: true });
                 await audio.play();
             }
         };
@@ -458,6 +535,12 @@ export function useTTSWsBidirectional() {
             };
 
             const payload = new TextEncoder().encode(JSON.stringify(request));
+            logTiming('input:send:start-session', {
+                event: EVENT.START_SESSION,
+                sessionId,
+                payloadBytes: payload.byteLength,
+                request,
+            });
             ws.send(buildFrame({
                 messageType: MESSAGE_TYPE.FULL_CLIENT_REQUEST,
                 serialization: 0x1,
@@ -469,13 +552,22 @@ export function useTTSWsBidirectional() {
         };
 
         const sendTaskRequest = (taskText: string) => {
-            const taskPayload = new TextEncoder().encode(JSON.stringify({
+            const taskRequest = {
                 event: EVENT.TASK_REQUEST,
                 namespace: 'BidirectionalTTS',
                 req_params: {
                     text: taskText,
                 },
-            }));
+            };
+            const taskPayload = new TextEncoder().encode(JSON.stringify(taskRequest));
+            logTiming('input:send:task-request', {
+                event: EVENT.TASK_REQUEST,
+                sessionId,
+                textLength: taskText.length,
+                text: summarizeText(taskText),
+                payloadBytes: taskPayload.byteLength,
+                request: taskRequest,
+            });
             ws.send(buildFrame({
                 messageType: MESSAGE_TYPE.FULL_CLIENT_REQUEST,
                 serialization: 0x1,
@@ -493,6 +585,11 @@ export function useTTSWsBidirectional() {
 
         const finishSession = () => {
             const finishPayload = new TextEncoder().encode('{}');
+            logTiming('input:send:finish-session', {
+                event: EVENT.FINISH_SESSION,
+                sessionId,
+                payloadBytes: finishPayload.byteLength,
+            });
             ws.send(buildFrame({
                 messageType: MESSAGE_TYPE.FULL_CLIENT_REQUEST,
                 serialization: 0x1,
@@ -508,6 +605,10 @@ export function useTTSWsBidirectional() {
             inputDispatchStarted = true;
 
             if (!options.simulateStreamingInput) {
+                logTiming('input:dispatch:start', {
+                    simulateStreamingInput: false,
+                    chunks: 1,
+                });
                 sendTaskRequest(text);
                 finishSession();
                 return;
@@ -515,18 +616,37 @@ export function useTTSWsBidirectional() {
 
             const chunks = splitTextForStreaming(text, options.streamChunkSize ?? 12);
             const delayMs = Math.max(30, options.streamDelayMs ?? 120);
+            logTiming('input:dispatch:start', {
+                simulateStreamingInput: true,
+                chunks: chunks.length,
+                delayMs,
+                chunkLengths: chunks.map((chunk) => chunk.length),
+            });
 
             const dispatchChunk = (index: number) => {
                 if (ws.readyState !== WebSocket.OPEN) {
+                    logTiming('input:dispatch:abort', {
+                        index,
+                        readyState: ws.readyState,
+                    });
                     return;
                 }
 
                 if (index >= chunks.length) {
                     streamTimerRef.current = null;
+                    logTiming('input:dispatch:done', {
+                        chunks: chunks.length,
+                    });
                     finishSession();
                     return;
                 }
 
+                logTiming('input:dispatch:chunk', {
+                    index: index + 1,
+                    chunks: chunks.length,
+                    textLength: chunks[index].length,
+                    text: summarizeText(chunks[index]),
+                });
                 sendTaskRequest(chunks[index]);
                 streamTimerRef.current = window.setTimeout(() => {
                     dispatchChunk(index + 1);
@@ -537,8 +657,13 @@ export function useTTSWsBidirectional() {
         };
 
         ws.onopen = () => {
-            console.info(`[TTS WS Bidirectional onopen] 连接成功 url=${redactSpeechUrl(wsUrl)}`);
+            logTiming('ws:open', { url: redactSpeechUrl(wsUrl) });
             const payload = new TextEncoder().encode('{}');
+            logTiming('input:send:start-connection', {
+                event: EVENT.START_CONNECTION,
+                connectId,
+                payloadBytes: payload.byteLength,
+            });
             ws.send(buildFrame({
                 messageType: MESSAGE_TYPE.FULL_CLIENT_REQUEST,
                 serialization: 0x1,
@@ -552,8 +677,19 @@ export function useTTSWsBidirectional() {
             if (!(event.data instanceof ArrayBuffer)) return;
             const parsed = parseMessage(event.data);
             if (!parsed) return;
+            logTiming('ws:message', {
+                messageType: parsed.messageType,
+                messageFlags: parsed.messageFlags,
+                serialization: parsed.serialization,
+                compression: parsed.compression,
+                event: parsed.event,
+                identifier: parsed.identifier,
+                payloadBytes: parsed.payload.length,
+                errorCode: parsed.errorCode,
+            });
 
             if (parsed.compression !== 0x0) {
+                logTiming('ws:unsupported-compression', { compression: parsed.compression });
                 setError('当前实现暂不支持双向流式压缩返回');
                 stop();
                 return;
@@ -562,8 +698,15 @@ export function useTTSWsBidirectional() {
             if (parsed.messageType === MESSAGE_TYPE.AUDIO_ONLY_RESPONSE) {
                 if (sessionStarted && parsed.payload.length > 0) {
                     audioChunks.push(parsed.payload);
+                    const totalAudioBytes = audioChunks.reduce((sum, chunk) => sum + chunk.length, 0);
                     if (!firstChunkRecorded) {
                         firstChunkRecorded = true;
+                        logTiming('audio:chunk:first', {
+                            bytes: parsed.payload.length,
+                            totalAudioBytes,
+                            event: parsed.event,
+                            identifier: parsed.identifier,
+                        });
                         setTtsState((prev) => ({
                             ...prev,
                             metrics: {
@@ -572,8 +715,23 @@ export function useTTSWsBidirectional() {
                             },
                         }));
                     }
+                    logTiming('audio:chunk', {
+                        chunkIndex: chunkCount + 1,
+                        bytes: parsed.payload.length,
+                        totalAudioBytes,
+                        event: parsed.event,
+                        identifier: parsed.identifier,
+                    });
                     if (streamingReady) {
+                        logTiming('audio:append:start', {
+                            chunkIndex: chunkCount + 1,
+                            bytes: parsed.payload.length,
+                        });
                         await streamingPlayer.appendChunk(parsed.payload);
+                        logTiming('audio:append:done', {
+                            chunkIndex: chunkCount + 1,
+                            bytes: parsed.payload.length,
+                        });
                     }
                     chunkCount += 1;
                     setTtsState((prev) => ({ ...prev, chunkCount }));
@@ -583,9 +741,22 @@ export function useTTSWsBidirectional() {
 
             if (parsed.messageType === MESSAGE_TYPE.FULL_SERVER_RESPONSE) {
                 const rawText = decodePayloadText(parsed.payload);
+                logTiming('output:json', {
+                    event: parsed.event,
+                    identifier: parsed.identifier,
+                    rawText,
+                });
                 const payload = rawText ? JSON.parse(rawText || '{}') : {};
                 const sentence = parseTTSSentenceTimestamp(payload);
                 if (sentence) {
+                    logTiming('subtitle:arrive', {
+                        text: sentence.text,
+                        firstWordStartTime: sentence.words[0]?.startTime,
+                        lastWordEndTime: sentence.words[sentence.words.length - 1]?.endTime,
+                        wordCount: sentence.words.length,
+                        event: parsed.event,
+                        identifier: parsed.identifier,
+                    });
                     setTtsState((prev) => ({
                         ...prev,
                         sentences: appendTTSSentenceTimestamp(prev.sentences, sentence),
@@ -593,23 +764,32 @@ export function useTTSWsBidirectional() {
                 }
 
                 if (parsed.event === EVENT.CONNECTION_STARTED) {
+                    logTiming('event:connection-started', { event: parsed.event, payload });
                     sendStartSession();
                     return;
                 }
 
                 if (parsed.event === EVENT.CONNECTION_FAILED) {
+                    logTiming('event:connection-failed', { event: parsed.event, payload });
                     setError(payload?.message ?? 'TTS 双向 WebSocket 建连失败');
                     stop();
                     return;
                 }
 
                 if (parsed.event === EVENT.SESSION_STARTED) {
+                    logTiming('event:session-started', { event: parsed.event, payload });
                     sessionStarted = true;
                     startInputDispatch();
                     return;
                 }
 
                 if (parsed.event === EVENT.SESSION_FINISHED) {
+                    logTiming('event:session-finished', {
+                        event: parsed.event,
+                        payload,
+                        chunkCount,
+                        totalAudioBytes: audioChunks.reduce((sum, chunk) => sum + chunk.length, 0),
+                    });
                     const statusCode = typeof payload?.status_code === 'number' ? payload.status_code : undefined;
                     if (statusCode !== undefined && statusCode !== 20000000) {
                         setError(payload?.message ?? `TTS 双向 WebSocket 会话结束异常(code=${statusCode})`);
@@ -626,6 +806,11 @@ export function useTTSWsBidirectional() {
                                 streamTimerRef.current = null;
                             }
                             const finishConnectionPayload = new TextEncoder().encode('{}');
+                            logTiming('input:send:finish-connection', {
+                                event: EVENT.FINISH_CONNECTION,
+                                connectId,
+                                payloadBytes: finishConnectionPayload.byteLength,
+                            });
                             ws.send(buildFrame({
                                 messageType: MESSAGE_TYPE.FULL_CLIENT_REQUEST,
                                 serialization: 0x1,
@@ -640,30 +825,44 @@ export function useTTSWsBidirectional() {
                 }
 
                 if (parsed.event === EVENT.SESSION_FAILED) {
+                    logTiming('event:session-failed', { event: parsed.event, payload });
                     setError(payload?.message ?? 'TTS 双向 WebSocket 会话失败');
                     stop();
                     return;
                 }
 
                 if (!sessionStarted && payload?.message) {
-                    console.info('[TTS WS Bidirectional Response]', payload);
+                    logTiming('output:message-before-session', { payload });
                 }
                 return;
             }
 
             if (parsed.messageType === MESSAGE_TYPE.ERROR) {
+                logTiming('ws:error-frame', {
+                    errorCode: parsed.errorCode,
+                    message: getErrorMessage(parsed),
+                });
                 setError(getErrorMessage(parsed));
                 stop();
             }
         };
 
         ws.onerror = (ev) => {
+            logTiming('ws:error', { event: ev.type });
             console.error('[TTS WS Bidirectional onerror]', ev);
             setError('TTS 双向 WebSocket 连接失败，请确认配置和权限有效');
             setIsPlaying(false);
         };
 
         ws.onclose = (ev) => {
+            logTiming('ws:close', {
+                code: ev.code,
+                reason: ev.reason,
+                wasClean: ev.wasClean,
+                chunkCount,
+                totalAudioBytes: audioChunks.reduce((sum, chunk) => sum + chunk.length, 0),
+                hasAudioElement: Boolean(audioRef.current),
+            });
             console.warn(`[TTS WS Bidirectional onclose] code=${ev.code} reason="${ev.reason}" wasClean=${ev.wasClean}`);
             wsRef.current = null;
             if (!audioRef.current) {

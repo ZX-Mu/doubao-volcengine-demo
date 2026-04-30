@@ -5,6 +5,7 @@ const ASR_ASYNC_URL = 'wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async
 const DEFAULT_RESOURCE_ID = 'volc.seedasr.sauc.duration';
 const WORKLET_URL = new URL('../worklets/asr-pcm-worklet.js', import.meta.url);
 const TARGET_SAMPLE_RATE = 16000;
+const FINAL_RESULT_TIMEOUT_MS = 30000;
 
 interface ASRAsyncOptions {
     appId: string;
@@ -36,7 +37,7 @@ function parseServerMessage(buffer: ArrayBuffer) {
     let sequenceOrCode: number | undefined;
     const view = new DataView(buffer);
 
-    if (header.messageType === 0x9 || header.messageType === 0xf) {
+    if (header.messageType === 0x9 || (header.messageType === 0xf && (header.messageFlags & 0x1) === 0x1)) {
         if (buffer.byteLength < offset + 8) return null;
         sequenceOrCode = view.getInt32(offset, false);
         offset += 4;
@@ -61,7 +62,20 @@ function parseServerMessage(buffer: ArrayBuffer) {
 }
 
 function extractText(payload: any) {
-    return payload?.result?.text ?? payload?.text ?? '';
+    const result = payload?.result ?? payload;
+    if (!result) return '';
+    if (typeof result.text === 'string') return result.text;
+    if (typeof result.transcript === 'string') return result.transcript;
+    if (Array.isArray(result)) {
+        return result
+            .map((item) => item?.text ?? item?.utterance ?? item?.transcript ?? '')
+            .filter(Boolean)
+            .join('');
+    }
+    if (Array.isArray(result.records)) return extractText({ result: result.records });
+    if (Array.isArray(result.results)) return extractText({ result: result.results });
+    if (Array.isArray(result.utterances)) return extractText({ result: result.utterances });
+    return '';
 }
 
 export function useASRAsync() {
@@ -75,6 +89,28 @@ export function useASRAsync() {
     const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
     const streamRef = useRef<MediaStream | null>(null);
     const sessionIdRef = useRef(0);
+    const finSentRef = useRef(false);
+    const finalResultTimerRef = useRef<number | null>(null);
+
+    const clearFinalResultTimer = useCallback(() => {
+        if (finalResultTimerRef.current === null) return;
+        window.clearTimeout(finalResultTimerRef.current);
+        finalResultTimerRef.current = null;
+    }, []);
+
+    const sendFinalAudio = useCallback((ws: WebSocket, payload = new Uint8Array(0)) => {
+        if (finSentRef.current || ws.readyState !== WebSocket.OPEN) return;
+
+        finSentRef.current = true;
+        ws.send(buildFrame(0x2, 0x2, 0x0, payload));
+        clearFinalResultTimer();
+        finalResultTimerRef.current = window.setTimeout(() => {
+            if (wsRef.current === ws && ws.readyState === WebSocket.OPEN) {
+                ws.close(1000, 'final result timeout');
+                wsRef.current = null;
+            }
+        }, FINAL_RESULT_TIMEOUT_MS);
+    }, [clearFinalResultTimer]);
 
     const releaseAudio = useCallback(() => {
         workletNodeRef.current?.port.close();
@@ -89,21 +125,25 @@ export function useASRAsync() {
     }, []);
 
     const stop = useCallback(() => {
-        sessionIdRef.current += 1;
-        releaseAudio();
-
         const ws = wsRef.current;
-        wsRef.current = null;
 
         if (ws?.readyState === WebSocket.OPEN) {
-            ws.send(buildFrame(0x2, 0x2, 0x0, new Uint8Array(0)));
-            ws.close(1000, 'session ended');
+            if (!finSentRef.current && workletNodeRef.current) {
+                workletNodeRef.current.port.postMessage({ type: 'flush' });
+            } else {
+                sendFinalAudio(ws);
+                releaseAudio();
+            }
         } else if (ws?.readyState === WebSocket.CONNECTING) {
+            wsRef.current = null;
             ws.close();
+            releaseAudio();
+        } else {
+            releaseAudio();
         }
 
         setIsRecording(false);
-    }, [releaseAudio]);
+    }, [releaseAudio, sendFinalAudio]);
 
     const start = useCallback(async (options: ASRAsyncOptions) => {
         if (!options.appId || !options.token) {
@@ -115,6 +155,8 @@ export function useASRAsync() {
         setResult({ text: '', isFinal: false, receivedAt: 0 });
         sessionIdRef.current += 1;
         const sessionId = sessionIdRef.current;
+        finSentRef.current = false;
+        clearFinalResultTimer();
 
         let stream: MediaStream;
         try {
@@ -200,7 +242,15 @@ export function useASRAsync() {
 
                 workletNode.port.onmessage = (event) => {
                     if (sessionIdRef.current !== sessionId || wsRef.current !== ws) return;
+                    if (event.data?.type === 'flush') {
+                        const buffer = event.data.buffer;
+                        const payload = buffer instanceof ArrayBuffer ? new Uint8Array(buffer) : new Uint8Array(0);
+                        sendFinalAudio(ws, payload);
+                        releaseAudio();
+                        return;
+                    }
                     if (event.data?.type === 'debug') return;
+                    if (finSentRef.current) return;
                     if (ws.readyState !== WebSocket.OPEN) return;
                     const chunk = event.data;
                     if (!(chunk instanceof ArrayBuffer) || chunk.byteLength === 0) return;
@@ -228,40 +278,58 @@ export function useASRAsync() {
                 return;
             }
 
+            const isFinal = (header.messageFlags & 0x2) === 0x2 || Boolean(
+                payload?.result?.is_final ??
+                payload?.result?.final ??
+                payload?.result?.end ??
+                payload?.is_final ??
+                payload?.final ??
+                payload?.end
+            );
+
+            const closeAfterFinal = () => {
+                if (isFinal && finSentRef.current && wsRef.current === ws && ws.readyState === WebSocket.OPEN) {
+                    clearFinalResultTimer();
+                    ws.close(1000, 'final result received');
+                    wsRef.current = null;
+                }
+            };
+
             const text = extractText(payload);
-            if (!text) return;
+            if (!text) {
+                closeAfterFinal();
+                return;
+            }
 
             setResult({
                 text,
-                isFinal: Boolean(
-                    payload?.result?.is_final ??
-                    payload?.result?.final ??
-                    payload?.result?.end ??
-                    payload?.is_final ??
-                    payload?.final ??
-                    payload?.end
-                ),
+                isFinal,
                 sequence: sequenceOrCode,
                 receivedAt: Date.now(),
             });
+
+            closeAfterFinal();
         };
 
         ws.onerror = () => {
             setError('ASR WebSocket 连接失败，请确认 async 模式的配置和权限有效');
+            clearFinalResultTimer();
             releaseAudio();
             wsRef.current = null;
             setIsRecording(false);
         };
 
         ws.onclose = (event) => {
+            clearFinalResultTimer();
             wsRef.current = null;
             setIsRecording(false);
+            finSentRef.current = false;
             if (event.code !== 1000 && event.code !== 1001) {
                 setError(`ASR 连接关闭 [${event.code}]${event.reason ? `: ${event.reason}` : ''}`);
                 releaseAudio();
             }
         };
-    }, [releaseAudio, stop]);
+    }, [clearFinalResultTimer, releaseAudio, sendFinalAudio, stop]);
 
     return { start, stop, isRecording, result, error };
 }

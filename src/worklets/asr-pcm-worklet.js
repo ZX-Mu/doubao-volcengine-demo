@@ -7,6 +7,10 @@ class AsrPcmWorklet extends AudioWorkletProcessor {
     this.targetFrameSize = 3200;
     this.port.onmessage = (event) => {
       const data = event.data || {};
+      if (data.type === 'flush') {
+        this.flushBuffer();
+        return;
+      }
       if (data.type !== 'config') return;
       if (typeof data.targetSampleRate === 'number') {
         this.targetSampleRate = data.targetSampleRate;
@@ -62,6 +66,26 @@ class AsrPcmWorklet extends AudioWorkletProcessor {
     return output;
   }
 
+  encodePcm(frame) {
+    const pcm = new Int16Array(frame.length);
+    for (let i = 0; i < frame.length; i += 1) {
+      const sample = Math.max(-1, Math.min(1, frame[i]));
+      pcm[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+    }
+    return pcm.buffer;
+  }
+
+  flushBuffer() {
+    if (this.frameBuffer.length === 0) {
+      this.port.postMessage({ type: 'flush', buffer: null });
+      return;
+    }
+
+    const buffer = this.encodePcm(this.frameBuffer);
+    this.frameBuffer = new Float32Array(0);
+    this.port.postMessage({ type: 'flush', buffer }, [buffer]);
+  }
+
   process(inputs) {
     const input = inputs[0];
     const channel = input?.[0];
@@ -80,13 +104,8 @@ class AsrPcmWorklet extends AudioWorkletProcessor {
       const frame = this.frameBuffer.slice(0, this.targetFrameSize);
       this.frameBuffer = this.frameBuffer.slice(this.targetFrameSize);
 
-      const pcm = new Int16Array(frame.length);
-      for (let i = 0; i < frame.length; i += 1) {
-        const sample = Math.max(-1, Math.min(1, frame[i]));
-        pcm[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
-      }
-
-      this.port.postMessage(pcm.buffer, [pcm.buffer]);
+      const buffer = this.encodePcm(frame);
+      this.port.postMessage(buffer, [buffer]);
     }
     return true;
   }

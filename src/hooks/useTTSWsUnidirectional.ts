@@ -208,6 +208,10 @@ function getErrorMessage(parsed: ParsedWsMessage) {
     }
 }
 
+function summarizeText(text: string, maxLength = 500) {
+    return text.length > maxLength ? `${text.slice(0, maxLength)}...(${text.length} chars)` : text;
+}
+
 export function useTTSWsUnidirectional() {
     const [isPlaying, setIsPlaying] = useState(false);
     const [error, setError] = useState<string | null>(null);
@@ -273,24 +277,47 @@ export function useTTSWsUnidirectional() {
         setIsPlaying(true);
 
         const requestStartedAt = performance.now();
+        const logTiming = (stage: string, details: Record<string, unknown> = {}) => {
+            console.info('[TTS WS Timing]', {
+                mode: options.direct ? 'unidirectional-direct' : 'unidirectional-proxy',
+                stage,
+                elapsedMs: Math.round((performance.now() - requestStartedAt) * 100) / 100,
+                at: new Date().toISOString(),
+                ...details,
+            });
+        };
+        logTiming('speak:start', {
+            textLength: text.length,
+            text: summarizeText(text),
+            voiceType: options.voiceType,
+            speechRate: options.speechRate ?? 0,
+            pitchRate: options.pitchRate ?? 0,
+            loudnessRate: options.loudnessRate ?? 0,
+            resourceId: options.resourceId,
+        });
         // 直连模式：浏览器直接连火山引擎 WSS，认证信息放 query params
         // 代理模式：通过 vite dev proxy 中转，由服务端添加认证 Header
         const wsUrl = options.direct
             ? `${TTS_WS_DIRECT_URL}?api_appid=${encodeURIComponent(options.appId)}&api_access_key=${encodeURIComponent(options.token)}&api_resource_id=${encodeURIComponent(options.resourceId)}`
             : `${TTS_WS_PROXY_URL}?appId=${encodeURIComponent(options.appId)}&token=${encodeURIComponent(options.token)}&resourceId=${encodeURIComponent(options.resourceId)}`;
         const ws = new WebSocket(wsUrl);
+        logTiming('ws:create', { url: redactSpeechUrl(wsUrl) });
         wsRef.current = ws;
         ws.binaryType = 'arraybuffer';
         let firstChunkRecorded = false;
         let firstPlaybackRecorded = false;
         const streamingPlayer = new StreamingAudioPlayer();
         const streamingReady = await streamingPlayer.init();
+        logTiming('streaming-player:init', { streamingReady });
         if (streamingReady) {
             streamingPlayerRef.current = streamingPlayer;
             audioRef.current = streamingPlayer.audio;
             streamingPlayer.audio.onplaying = () => {
                 if (firstPlaybackRecorded) return;
                 firstPlaybackRecorded = true;
+                logTiming('audio:playing:first', {
+                    audioCurrentTimeSec: streamingPlayer.audio.currentTime,
+                });
                 setTtsState((prev) => ({
                     ...prev,
                     metrics: {
@@ -299,7 +326,24 @@ export function useTTSWsUnidirectional() {
                     },
                 }));
             };
-            streamingPlayer.audio.onended = () => setIsPlaying(false);
+            streamingPlayer.audio.oncanplay = () => {
+                logTiming('audio:canplay', {
+                    audioCurrentTimeSec: streamingPlayer.audio.currentTime,
+                    readyState: streamingPlayer.audio.readyState,
+                });
+            };
+            streamingPlayer.audio.onwaiting = () => {
+                logTiming('audio:waiting', {
+                    audioCurrentTimeSec: streamingPlayer.audio.currentTime,
+                    readyState: streamingPlayer.audio.readyState,
+                });
+            };
+            streamingPlayer.audio.onended = () => {
+                logTiming('audio:ended', {
+                    audioCurrentTimeSec: streamingPlayer.audio.currentTime,
+                });
+                setIsPlaying(false);
+            };
             streamingPlayer.audio.ontimeupdate = () => {
                 setTtsState((prev) => ({
                     ...prev,
@@ -308,6 +352,7 @@ export function useTTSWsUnidirectional() {
             };
             streamingPlayer.audio.onerror = () => {
                 const mediaError = streamingPlayer.audio.error;
+                logTiming('audio:error', { code: mediaError?.code ?? 'unknown' });
                 setError(`浏览器播放音频失败(code=${mediaError?.code ?? 'unknown'})，请尝试下载后确认返回格式`);
                 setIsPlaying(false);
             };
@@ -323,6 +368,7 @@ export function useTTSWsUnidirectional() {
 
             const mergedAudio = concatUint8Arrays(audioChunks);
             if (mergedAudio.length === 0) {
+                logTiming('audio:finalize:no-audio');
                 setError('TTS WebSocket 未返回音频数据');
                 stop();
                 return;
@@ -331,6 +377,11 @@ export function useTTSWsUnidirectional() {
             if (streamingReady) {
                 streamingPlayer.finish();
             }
+            logTiming('audio:finalize', {
+                chunkCount,
+                totalAudioBytes: mergedAudio.length,
+                streamingReady,
+            });
 
             const blobUrl = URL.createObjectURL(new Blob([mergedAudio], { type: 'audio/mpeg' }));
 
@@ -346,6 +397,10 @@ export function useTTSWsUnidirectional() {
                 audio.onplaying = () => {
                     if (firstPlaybackRecorded) return;
                     firstPlaybackRecorded = true;
+                    logTiming('audio:playing:first', {
+                        audioCurrentTimeSec: audio.currentTime,
+                        fallbackBlob: true,
+                    });
                     setTtsState((prev) => ({
                         ...prev,
                         metrics: {
@@ -354,7 +409,20 @@ export function useTTSWsUnidirectional() {
                         },
                     }));
                 };
-                audio.onended = () => setIsPlaying(false);
+                audio.oncanplay = () => {
+                    logTiming('audio:canplay', {
+                        audioCurrentTimeSec: audio.currentTime,
+                        readyState: audio.readyState,
+                        fallbackBlob: true,
+                    });
+                };
+                audio.onended = () => {
+                    logTiming('audio:ended', {
+                        audioCurrentTimeSec: audio.currentTime,
+                        fallbackBlob: true,
+                    });
+                    setIsPlaying(false);
+                };
                 audio.ontimeupdate = () => {
                     setTtsState((prev) => ({
                         ...prev,
@@ -363,13 +431,16 @@ export function useTTSWsUnidirectional() {
                 };
                 audio.onerror = () => {
                     const mediaError = audio.error;
+                    logTiming('audio:error', { code: mediaError?.code ?? 'unknown', fallbackBlob: true });
                     setError(`浏览器播放音频失败(code=${mediaError?.code ?? 'unknown'})，请尝试下载后确认返回格式`);
                     setIsPlaying(false);
                 };
 
                 try {
+                    logTiming('audio:play:attempt', { fallbackBlob: true });
                     await audio.play();
                 } catch (error: any) {
+                    logTiming('audio:play:error', { message: error?.message ?? 'unknown', fallbackBlob: true });
                     setError(error?.message || '浏览器自动播放失败，请手动下载确认返回格式');
                     setIsPlaying(false);
                 }
@@ -377,7 +448,7 @@ export function useTTSWsUnidirectional() {
         };
 
         ws.onopen = () => {
-            console.info(`[TTS WS onopen] 连接成功 url=${redactSpeechUrl(wsUrl)}`);
+            logTiming('ws:open', { url: redactSpeechUrl(wsUrl) });
             const reqId = generateReqId();
             const request = {
                 user: {
@@ -401,6 +472,11 @@ export function useTTSWsUnidirectional() {
             };
 
             const payload = new TextEncoder().encode(JSON.stringify(request));
+            logTiming('input:send:full-client-request', {
+                reqId,
+                payloadBytes: payload.byteLength,
+                request,
+            });
             ws.send(buildFrame(0x1, 0x1, 0x0, payload));
         };
 
@@ -408,6 +484,17 @@ export function useTTSWsUnidirectional() {
             if (!(event.data instanceof ArrayBuffer)) return;
             const parsed = parseMessage(event.data);
             if (!parsed) return;
+            logTiming('ws:message', {
+                messageType: parsed.messageType,
+                messageFlags: parsed.messageFlags,
+                serialization: parsed.serialization,
+                compression: parsed.compression,
+                event: parsed.event,
+                sequence: parsed.sequence,
+                payloadBytes: parsed.payload.length,
+                identifier: parsed.identifier,
+                errorCode: parsed.errorCode,
+            });
 
             if (parsed.messageType === 0xb) {
                 const payload = parsed.payload;
@@ -418,8 +505,15 @@ export function useTTSWsUnidirectional() {
 
                 if (payload.length > 0) {
                     audioChunks.push(payload);
+                    const totalAudioBytes = audioChunks.reduce((sum, chunk) => sum + chunk.length, 0);
                     if (!firstChunkRecorded) {
                         firstChunkRecorded = true;
+                        logTiming('audio:chunk:first', {
+                            bytes: payload.length,
+                            totalAudioBytes,
+                            sequence: parsed.sequence,
+                            isFinalPacket,
+                        });
                         setTtsState((prev) => ({
                             ...prev,
                             metrics: {
@@ -428,14 +522,33 @@ export function useTTSWsUnidirectional() {
                             },
                         }));
                     }
+                    logTiming('audio:chunk', {
+                        chunkIndex: chunkCount + 1,
+                        bytes: payload.length,
+                        totalAudioBytes,
+                        sequence: parsed.sequence,
+                        isFinalPacket,
+                    });
                     if (streamingReady) {
+                        logTiming('audio:append:start', {
+                            chunkIndex: chunkCount + 1,
+                            bytes: payload.length,
+                        });
                         await streamingPlayer.appendChunk(payload);
+                        logTiming('audio:append:done', {
+                            chunkIndex: chunkCount + 1,
+                            bytes: payload.length,
+                        });
                     }
                     chunkCount += 1;
                     setTtsState((prev) => ({ ...prev, chunkCount }));
                 }
 
                 if (isFinalPacket) {
+                    logTiming('audio:final-packet', {
+                        sequence: parsed.sequence,
+                        messageFlags: parsed.messageFlags,
+                    });
                     await finalizeAudio();
                 }
                 return;
@@ -444,11 +557,22 @@ export function useTTSWsUnidirectional() {
             if (parsed.messageType === 0x9) {
                 const rawText = decodePayloadText(parsed.payload);
                 if (!rawText) return;
+                logTiming('output:json', {
+                    event: parsed.event,
+                    rawText,
+                });
 
                 try {
                     const payload = JSON.parse(rawText);
                     const sentence = parseTTSSentenceTimestamp(payload);
                     if (sentence) {
+                        logTiming('subtitle:arrive', {
+                            text: sentence.text,
+                            firstWordStartTime: sentence.words[0]?.startTime,
+                            lastWordEndTime: sentence.words[sentence.words.length - 1]?.endTime,
+                            wordCount: sentence.words.length,
+                            event: parsed.event,
+                        });
                         setTtsState((prev) => ({
                             ...prev,
                             sentences: appendTTSSentenceTimestamp(prev.sentences, sentence),
@@ -462,6 +586,11 @@ export function useTTSWsUnidirectional() {
                     }
 
                     if (parsed.event === 152 || rawText === '{}') {
+                        logTiming('session:finish-signal', {
+                            event: parsed.event,
+                            rawText,
+                            hasAudio: audioChunks.length > 0,
+                        });
                         if (audioChunks.length > 0) {
                             await finalizeAudio();
                         }
@@ -470,7 +599,7 @@ export function useTTSWsUnidirectional() {
                         }
                     }
                 } catch {
-                    console.info('[TTS WS Response]', rawText);
+                    logTiming('output:text', { rawText });
                 }
                 return;
             }
@@ -478,7 +607,7 @@ export function useTTSWsUnidirectional() {
             if (parsed.messageType === 0xc) {
                 const rawText = decodePayloadText(parsed.payload);
                 if (rawText) {
-                    console.info('[TTS WS Frontend Response]', rawText);
+                    logTiming('output:frontend-response', { rawText });
                 }
                 if (audioChunks.length > 0) {
                     await finalizeAudio();
@@ -490,18 +619,31 @@ export function useTTSWsUnidirectional() {
             }
 
             if (parsed.messageType === 0xf) {
+                logTiming('ws:error-frame', {
+                    errorCode: parsed.errorCode,
+                    message: getErrorMessage(parsed),
+                });
                 setError(getErrorMessage(parsed));
                 stop();
             }
         };
 
         ws.onerror = (ev) => {
+            logTiming('ws:error', { event: ev.type });
             console.error('[TTS WS onerror]', ev);
             setError('TTS WebSocket 连接失败，请确认配置和权限有效');
             setIsPlaying(false);
         };
 
         ws.onclose = (ev) => {
+            logTiming('ws:close', {
+                code: ev.code,
+                reason: ev.reason,
+                wasClean: ev.wasClean,
+                chunkCount,
+                totalAudioBytes: audioChunks.reduce((sum, chunk) => sum + chunk.length, 0),
+                finalized,
+            });
             console.warn(`[TTS WS onclose] code=${ev.code} reason="${ev.reason}" wasClean=${ev.wasClean}`);
             wsRef.current = null;
             if (!finalized && audioChunks.length > 0) {
